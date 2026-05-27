@@ -1,0 +1,158 @@
+alias: Predict Overnight Aircon Usage
+description: >-
+  Automatically sets input_boolean.aircon_expected_overnight based on weather
+  forecast, indoor temperatures, and current aircon usage patterns. Triggers at
+  a set time each afternoon and whenever the weather forecast or aircon state
+  changes. Shared as an example — adapt entity IDs, temperature thresholds, and
+  climate entities to your own system.
+
+# ─────────────────────────────────────────────────────────────────
+# CONFIGURATION — edit these to match your system
+# ─────────────────────────────────────────────────────────────────
+#
+# ← REPLACE all entity IDs with your own.
+# Use Developer Tools → States to find the correct entity IDs.
+#
+# Key values to adjust:
+#   - Weather entity (your local weather integration)
+#   - Climate entities (your aircon/HVAC controllers)
+#   - Temperature thresholds (cold_threshold, hot_threshold, etc.)
+#   - Trigger time (currently 17:00)
+#
+# ─────────────────────────────────────────────────────────────────
+
+triggers:
+  - at: "17:00:00"         # ← ADJUST: time to run daily assessment
+    trigger: time
+
+  - entity_id:
+      - weather.YOUR_WEATHER_ENTITY_HOURLY   # ← REPLACE with your hourly weather entity
+    trigger: state
+
+  - entity_id:
+      - climate.YOUR_AIRCON_CONTROLLER_1     # ← REPLACE with your climate entity/entities
+      - climate.YOUR_AIRCON_CONTROLLER_2     # ← REPLACE or remove if only one controller
+    to:
+      - heat
+      - cool
+    trigger: state
+
+conditions: []
+
+actions:
+  # Step 1: Fetch hourly weather forecast
+  - data:
+      type: hourly
+    target:
+      entity_id: weather.YOUR_WEATHER_ENTITY_HOURLY   # ← REPLACE
+    response_variable: forecast_response
+    action: weather.get_forecasts
+
+  # Step 2: Calculate variables from forecast and current state
+  - variables:
+      forecast: "{{ forecast_response['weather.YOUR_WEATHER_ENTITY_HOURLY'].forecast }}"   # ← REPLACE
+
+      # Extract overnight temperatures (midnight to 6am)
+      overnight_temps: >
+        {% set ns = namespace(temps=[], found_midnight=false) %}
+        {% for hour in forecast[:48] if hour is defined %}
+          {% set forecast_time = hour.datetime | as_datetime %}
+          {% set forecast_hour = forecast_time.hour %}
+          {% if forecast_hour == 0 and not ns.found_midnight %}
+            {% set ns.found_midnight = true %}
+          {% endif %}
+          {% if ns.found_midnight and forecast_hour >= 0 and forecast_hour <= 6 %}
+            {% set ns.temps = ns.temps + [hour.temperature] %}
+          {% endif %}
+          {% if ns.found_midnight and forecast_hour == 6 %}
+            {% break %}
+          {% endif %}
+        {% endfor %}
+        {{ ns.temps }}
+
+      # Minimum overnight temperature
+      tonight_min: |
+        {% set temps = overnight_temps %}
+        {% if temps | count > 0 %}
+          {{ temps | min | float }}
+        {% else %}
+          20
+        {% endif %}
+
+      # Current indoor temperatures — add or remove as needed
+      indoor_temp_1: >-
+        {{ state_attr('climate.YOUR_AIRCON_CONTROLLER_1', 'current_temperature') | float(22) }}
+        # ← REPLACE with your first climate entity
+
+      indoor_temp_2: >-
+        {{ state_attr('climate.YOUR_AIRCON_CONTROLLER_2', 'current_temperature') | float(22) }}
+        # ← REPLACE with your second climate entity (or remove)
+
+      # Average indoor temperature across all zones
+      avg_indoor_temp: >-
+        {{ ((indoor_temp_1 + indoor_temp_2) / 2) | round(1) }}
+        # ← ADJUST: add more zones or remove if only one
+
+      # Current aircon modes
+      any_heating: >-
+        {{ is_state('climate.YOUR_AIRCON_CONTROLLER_1', 'heat') or
+           is_state('climate.YOUR_AIRCON_CONTROLLER_2', 'heat') }}
+        # ← REPLACE with your climate entities
+
+      any_cooling: >-
+        {{ is_state('climate.YOUR_AIRCON_CONTROLLER_1', 'cool') or
+           is_state('climate.YOUR_AIRCON_CONTROLLER_2', 'cool') }}
+        # ← REPLACE with your climate entities
+
+      # ── TEMPERATURE THRESHOLDS ─────────────────────────────────
+      # Adjust these to match your climate and comfort preferences
+
+      cold_threshold: 10        # ← ADJUST: outdoor min below this → likely heating needed
+      indoor_cold_threshold: 20 # ← ADJUST: indoor temp below this + cold outside → heating
+      hot_threshold: 24         # ← ADJUST: outdoor min above this → likely cooling needed
+      indoor_hot_threshold: 26  # ← ADJUST: indoor temp above this → cooling likely
+
+      # ── DECISION LOGIC ────────────────────────────────────────
+      expect_heating: >
+        {{ (tonight_min < cold_threshold and avg_indoor_temp < indoor_cold_threshold)
+           or (any_heating and tonight_min < 12) }}
+
+      expect_cooling: |
+        {{ tonight_min > hot_threshold
+           or avg_indoor_temp > indoor_hot_threshold
+           or (any_cooling and tonight_min >= 18) }}
+
+      expect_aircon: "{{ expect_heating or expect_cooling }}"
+
+  # Step 3: Set the overnight aircon flag
+  - choose:
+      - conditions:
+          - condition: template
+            value_template: "{{ expect_aircon }}"
+        sequence:
+          - target:
+              entity_id: input_boolean.aircon_expected_overnight
+            action: input_boolean.turn_on
+          - data:
+              message: >-
+                Aircon expected overnight.
+                Tonight min: {{ tonight_min }}°C,
+                Avg indoor: {{ avg_indoor_temp }}°C,
+                Heating: {{ expect_heating }},
+                Cooling: {{ expect_cooling }}
+              level: info
+            action: system_log.write
+
+    default:
+      - target:
+          entity_id: input_boolean.aircon_expected_overnight
+        action: input_boolean.turn_off
+      - data:
+          message: >-
+            No aircon expected overnight.
+            Tonight min: {{ tonight_min }}°C,
+            Avg indoor: {{ avg_indoor_temp }}°C
+          level: info
+        action: system_log.write
+
+mode: single
